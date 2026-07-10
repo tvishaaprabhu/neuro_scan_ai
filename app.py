@@ -174,19 +174,22 @@ st.markdown("""
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def load_nifti(file_bytes):
-    """Load a NIfTI file from bytes, return (pixel_array, is_multi)."""
+    """Load a NIfTI file from bytes, return pixel array."""
     import nibabel as nib
     import tempfile, os
     suffix = ".nii.gz" if file_bytes.name.endswith(".gz") else ".nii"
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
         tmp.write(file_bytes.read())
         tmp_path = tmp.name
-    img = nib.load(tmp_path)
-    os.unlink(tmp_path)
-    data = np.array(img.dataobj)
-    # Normalise orientation: bring to (H, W, slices) if 3D
+    try:
+        img = nib.load(tmp_path)
+        data = img.get_fdata(dtype=np.float32)
+    finally:
+        os.unlink(tmp_path)
+    # Drop 4th dimension if present (take first volume)
     if data.ndim == 4:
         data = data[:, :, :, 0]
+    # Reorient to standard (H, W, slices)
     data = np.rot90(data, k=1, axes=(0, 1))
     return data
 
