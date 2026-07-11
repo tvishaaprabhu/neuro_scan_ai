@@ -12,14 +12,26 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
+# Force dark background before CSS loads
+st.markdown("""
+<style>
+    .stApp { background-color: #0c0f1a !important; }
+</style>
+""", unsafe_allow_html=True)
+
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=DM+Sans:ital,wght@0,300;0,400;0,500;1,400&family=DM+Serif+Display&family=Space+Mono:wght@400;700&display=swap');
 
 html, body, [class*="css"] {
     font-family: 'DM Sans', sans-serif;
-    background-color: #0c0f1a;
+    background-color: #0c0f1a !important;
     color: #c9cdd9;
+}
+.stApp, [data-testid="stAppViewContainer"],
+[data-testid="stHeader"], [data-testid="stToolbar"],
+[data-testid="stMain"], [data-testid="block-container"] {
+    background-color: #0c0f1a !important;
 }
 #MainMenu, footer, header { visibility: hidden; }
 .block-container {
