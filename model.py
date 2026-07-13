@@ -1,10 +1,4 @@
-"""
-Shared model definition — imported by BOTH train.py and predict.py
-so the architecture always matches the saved weights.
-
-Custom CNN, per mentor's advice: own conv stack, BatchNorm + Dropout,
-no transfer learning.
-"""
+"""Shared model definition — imported by both train.py and predict.py."""
 import torch
 import torch.nn as nn
 
@@ -34,7 +28,6 @@ class BrainTumorCNN(nn.Module):
         self.block3 = conv_block(64,  128, 0.30)   # 32  -> 16
         self.block4 = conv_block(128, 256, 0.30)   # 16  -> 8
 
-        # Grad-CAM taps this layer
         self.features = nn.Sequential(
             self.block1, self.block2, self.block3, self.block4
         )
@@ -55,4 +48,4 @@ class BrainTumorCNN(nn.Module):
 
     def gradcam_target_layer(self):
         """Last conv layer before pooling — where Grad-CAM hooks in."""
-        return self.block4[4]   # the 2nd Conv2d inside block4
+        return self.block4[4]
