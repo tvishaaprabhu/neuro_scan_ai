@@ -195,13 +195,44 @@ def adaptive_preprocess(img):
     return out, " · ".join(steps)
 
 
+MIN_CKPT_BYTES = 300_000_000        # real file is ~375 MB
+
+
+def _ckpt_is_valid(path):
+    """
+    A .pth is a ZIP archive. A truncated download or an HTML error page saved
+    under the .pth name will pass os.path.exists() but blow up inside torch.load
+    with 'failed finding central directory'. Check size + ZIP magic bytes.
+    """
+    if not os.path.exists(path):
+        return False
+    if os.path.getsize(path) < MIN_CKPT_BYTES:
+        return False
+    with open(path, "rb") as f:
+        return f.read(2) == b"PK"       # ZIP magic
+
+
 def download_medsam():
-    """Stream the checkpoint to disk. urllib = stdlib, no wget/curl needed."""
-    if os.path.exists(MEDSAM_CKPT):
+    """Stream the checkpoint, validate it, and re-fetch if the cached one is bad."""
+    if _ckpt_is_valid(MEDSAM_CKPT):
         return True
+
+    if os.path.exists(MEDSAM_CKPT):
+        st.info("Cached checkpoint was incomplete or corrupt — re-downloading.")
+        os.remove(MEDSAM_CKPT)
+
     bar = st.progress(0.0, text="Downloading MedSAM checkpoint (375 MB, one-time)…")
     try:
-        with urllib.request.urlopen(MEDSAM_URL) as r, open(MEDSAM_CKPT, "wb") as f:
+        # Zenodo 403s the default urllib User-Agent and serves an HTML page
+        # instead of the file — which is exactly how you end up with a
+        # 'corrupt' .pth that is really just HTML.
+        req = urllib.request.Request(
+            MEDSAM_URL, headers={"User-Agent": "Mozilla/5.0 (NeuroScan)"})
+        with urllib.request.urlopen(req, timeout=60) as r, open(MEDSAM_CKPT, "wb") as f:
+            ctype = r.headers.get("Content-Type", "")
+            if "html" in ctype.lower():
+                raise RuntimeError(f"server returned a web page, not a file ({ctype})")
+
             total = int(r.headers.get("Content-Length", 0)) or 375_000_000
             done = 0
             while True:
@@ -213,12 +244,20 @@ def download_medsam():
                 bar.progress(min(done / total, 1.0),
                              text=f"Downloading MedSAM… {done/1e6:.0f} / {total/1e6:.0f} MB")
         bar.empty()
+
+        if not _ckpt_is_valid(MEDSAM_CKPT):
+            size = os.path.getsize(MEDSAM_CKPT) if os.path.exists(MEDSAM_CKPT) else 0
+            os.remove(MEDSAM_CKPT)
+            raise RuntimeError(
+                f"downloaded file failed validation ({size/1e6:.1f} MB, expected ~375 MB)")
+
         return True
+
     except Exception as e:
         bar.empty()
         if os.path.exists(MEDSAM_CKPT):
             os.remove(MEDSAM_CKPT)
-        st.error(f"Checkpoint download failed: {e}")
+        st.error(f"MedSAM checkpoint download failed: {e}")
         return False
 
 
@@ -631,9 +670,23 @@ engine = "MedSAM"
 try:
     with st.spinner("Running MedSAM… (first run loads the model, ~30s)"):
         mask = run_medsam(img_rgb, bbox)
-except (MemoryError, RuntimeError) as e:
-    st.warning(f"MedSAM could not run in the available memory ({e}). "
-               "Falling back to Otsu thresholding.")
+except Exception as e:
+    msg = str(e)
+    if "central directory" in msg or "PytorchStreamReader" in msg:
+        # Corrupt checkpoint, NOT memory. Bust the cache so the next click
+        # re-downloads instead of failing on the same bad file forever.
+        load_medsam.clear()
+        if os.path.exists(MEDSAM_CKPT):
+            os.remove(MEDSAM_CKPT)
+        st.error("The MedSAM checkpoint on disk was corrupt. It has been deleted — "
+                 "click **Run Segmentation** again to re-download it.")
+        st.stop()
+    elif isinstance(e, MemoryError) or "out of memory" in msg.lower() or "alloc" in msg.lower():
+        st.warning("MedSAM ran out of memory on this instance. "
+                   "Falling back to Otsu thresholding.")
+    else:
+        st.warning(f"MedSAM failed ({type(e).__name__}: {msg}). "
+                   "Falling back to Otsu thresholding.")
     mask = trace_otsu(img_array, bbox)
     engine = "Otsu fallback"
 
