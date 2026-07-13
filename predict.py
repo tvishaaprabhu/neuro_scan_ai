@@ -1,134 +1,88 @@
-# predict.py
-# Drop this file in the same folder as app.py
-# Import in app.py with: from predict import load_model, predict, get_gradcam
-
+"""
+Inference + Grad-CAM in PyTorch.  Same public API as the old TF version,
+so app.py barely changes:
+    load_model, preprocess, predict, get_gradcam, overlay_gradcam, CLASS_NAMES
+"""
 import numpy as np
 import cv2
-import tensorflow as tf
+import torch
+import torch.nn.functional as F
 import streamlit as st
-from typing import Tuple
 
-# Class order matches what flow_from_directory assigns alphabetically
-CLASS_NAMES = {
-    0: "Glioma",
-    1: "Meningioma",
-    2: "No Tumor",
-    3: "Pituitary Tumor"
-}
+from model import BrainTumorCNN, CLASS_NAMES, IMG_SIZE  # noqa: F401
 
-# Grad-CAM target layers for each backbone in the stacking model
-VGG_LAYER = "block5_conv3"
-RESNET_LAYER = "conv5_block3_out"
+torch.set_num_threads(1)   # keep CPU RAM/threads predictable on Streamlit Cloud
 
 
-@st.cache_resource
-def load_model(model_path: str):
-    """Load the trained ensemble model once and cache it."""
-    model = tf.keras.models.load_model(model_path, compile=False)
-    model.build((None, 128, 128, 1))
-    model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+@st.cache_resource(show_spinner=False)
+def load_model(weights_path: str = "brain_tumor_detector.pt"):
+    model = BrainTumorCNN()
+    state = torch.load(weights_path, map_location="cpu")
+    model.load_state_dict(state)
+    model.eval()
     return model
 
 
-def preprocess(image_array: np.ndarray) -> np.ndarray:
+def preprocess(image_array: np.ndarray) -> torch.Tensor:
+    """uint8 HxW (or HxWxC) -> float tensor (1, 1, 128, 128) in [0,1]."""
+    img = image_array
+    if img.ndim == 3:
+        img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    img = cv2.resize(img, (IMG_SIZE, IMG_SIZE)).astype(np.float32) / 255.0
+    return torch.from_numpy(img)[None, None, :, :]
+
+
+def predict(model, x: torch.Tensor):
+    """-> (class_name, confidence, all_probs ndarray[4])"""
+    with torch.inference_mode():
+        logits = model(x)
+        probs = F.softmax(logits, dim=1)[0].numpy()
+    idx = int(probs.argmax())
+    return CLASS_NAMES[idx], float(probs[idx]), probs
+
+
+def get_gradcam(model, x: torch.Tensor, class_idx: int) -> np.ndarray:
     """
-    Takes a 2D or 3D numpy array (PIL image converted to numpy),
-    resizes to 128x128, converts to grayscale, normalizes to [0,1].
-    Returns shape (1, 128, 128, 1) — ready for model input.
+    Grad-CAM via forward/backward hooks on the last conv layer.
+    Returns a JET-colourised RGB heatmap, uint8 (128, 128, 3).
     """
-    if len(image_array.shape) == 3 and image_array.shape[2] == 3:
-        image_array = cv2.cvtColor(image_array, cv2.COLOR_RGB2GRAY)
-    elif len(image_array.shape) == 3 and image_array.shape[2] == 4:
-        image_array = cv2.cvtColor(image_array, cv2.COLOR_RGBA2GRAY)
+    acts, grads = {}, {}
+    layer = model.gradcam_target_layer()
 
-    resized = cv2.resize(image_array, (128, 128))
-    normalized = resized.astype(np.float32) / 255.0
-    return np.expand_dims(np.expand_dims(normalized, axis=-1), axis=0)
+    h1 = layer.register_forward_hook(
+        lambda m, i, o: acts.__setitem__("v", o.detach())
+    )
+    h2 = layer.register_full_backward_hook(
+        lambda m, gi, go: grads.__setitem__("v", go[0].detach())
+    )
 
+    try:
+        model.zero_grad()
+        out = model(x)                     # grad needed -> no inference_mode
+        out[0, class_idx].backward()
 
-def predict(model, input_tensor: np.ndarray) -> Tuple[str, float, np.ndarray]:
-    """
-    Run forward pass. Returns:
-    - predicted class name (str)
-    - confidence score (float, 0-1)
-    - full probability array (np.ndarray of shape (4,))
-    """
-    probs = model.predict(input_tensor, verbose=0)[0]
-    class_idx = int(np.argmax(probs))
-    return CLASS_NAMES[class_idx], float(probs[class_idx]), probs
+        a = acts["v"][0]                   # (C, h, w)
+        g = grads["v"][0]                  # (C, h, w)
+        weights = g.mean(dim=(1, 2))       # channel importance
+        cam = F.relu((weights[:, None, None] * a).sum(0))
+        cam = cam.cpu().numpy()
+    except Exception:
+        cam = np.zeros((8, 8), np.float32)
+    finally:
+        h1.remove()
+        h2.remove()
+        model.zero_grad()
 
+    if cam.max() > 0:
+        cam = cam / cam.max()
+    cam = cv2.resize(cam.astype(np.float32), (IMG_SIZE, IMG_SIZE))
 
-def get_gradcam(model, input_tensor: np.ndarray, class_idx: int) -> np.ndarray:
-    """
-    Generates a blended Grad-CAM heatmap by averaging activations
-    from VGG16 (block5_conv3) and ResNet50 (conv5_block3_out).
-    Returns a colorized RGB heatmap as uint8 numpy array (128x128x3).
-    """
-    def _single_gradcam(layer_name: str) -> np.ndarray:
-        try:
-            grad_model = tf.keras.models.Model(
-                inputs=model.input,
-                outputs=[model.get_layer(layer_name).output, model.output]
-            )
-            with tf.GradientTape() as tape:
-                layer_output, predictions = grad_model(input_tensor)
-                target_class_score = predictions[:, class_idx]
-
-            grads = tape.gradient(target_class_score, layer_output)
-
-            # Guard against None gradients
-            if grads is None:
-                return np.zeros((4, 4))
-
-            pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
-            layer_output = layer_output[0]
-            heatmap = layer_output @ pooled_grads[..., tf.newaxis]
-            heatmap = tf.squeeze(heatmap).numpy()
-
-            # Guard against scalar or empty output
-            if heatmap.ndim == 0 or heatmap.size == 0:
-                return np.zeros((4, 4))
-
-            # Ensure 2D
-            if heatmap.ndim > 2:
-                heatmap = heatmap.reshape(heatmap.shape[0], -1)
-            elif heatmap.ndim == 1:
-                side = max(1, int(np.sqrt(heatmap.size)))
-                heatmap = heatmap[:side*side].reshape(side, side)
-
-            # ReLU + normalize
-            heatmap = np.maximum(heatmap, 0)
-            if heatmap.max() > 0:
-                heatmap /= heatmap.max()
-
-            return heatmap
-
-        except Exception:
-            return np.zeros((4, 4))
-
-    vgg_heatmap = _single_gradcam(VGG_LAYER)
-    resnet_heatmap = _single_gradcam(RESNET_LAYER)
-
-    vgg_heatmap = cv2.resize(vgg_heatmap.astype(np.float32), (128, 128))
-    resnet_heatmap = cv2.resize(resnet_heatmap.astype(np.float32), (128, 128))
-
-    blended = cv2.addWeighted(vgg_heatmap, 0.5, resnet_heatmap, 0.5, 0)
-
-    blended_uint8 = np.uint8(255 * blended)
-    colorized = cv2.applyColorMap(blended_uint8, cv2.COLORMAP_JET)
-    colorized_rgb = cv2.cvtColor(colorized, cv2.COLOR_BGR2RGB)
-
-    return colorized_rgb
+    colored = cv2.applyColorMap(np.uint8(255 * cam), cv2.COLORMAP_JET)
+    return cv2.cvtColor(colored, cv2.COLOR_BGR2RGB)
 
 
-def overlay_gradcam(original_gray: np.ndarray, heatmap_rgb: np.ndarray, alpha=0.4) -> np.ndarray:
-    """
-    Blends the original grayscale scan with the Grad-CAM heatmap for display.
-    original_gray: 2D array (128x128)
-    heatmap_rgb: 3D array (128x128x3)
-    Returns: blended RGB image (128x128x3) as uint8
-    """
-    orig_uint8 = np.uint8(original_gray * 255)
-    orig_rgb = cv2.cvtColor(orig_uint8, cv2.COLOR_GRAY2RGB)
-    overlay = cv2.addWeighted(orig_rgb, 1 - alpha, heatmap_rgb, alpha, 0)
-    return overlay
+def overlay_gradcam(gray_norm: np.ndarray, heatmap_rgb: np.ndarray,
+                    alpha: float = 0.4) -> np.ndarray:
+    """gray_norm: float 128x128 in [0,1].  -> blended uint8 RGB."""
+    base = cv2.cvtColor(np.uint8(gray_norm * 255), cv2.COLOR_GRAY2RGB)
+    return cv2.addWeighted(base, 1 - alpha, heatmap_rgb, alpha, 0)
