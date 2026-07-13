@@ -1,6 +1,9 @@
 import os
 import io
+import gc
 import base64
+import urllib.request
+
 import streamlit as st
 import streamlit.components.v1 as components
 import numpy as np
@@ -8,265 +11,137 @@ from PIL import Image
 import cv2
 import pydicom
 
-st.set_page_config(
-    page_title="NeuroScan AI",
-    page_icon="🧠",
-    layout="wide",
-    initial_sidebar_state="collapsed"
-)
+st.set_page_config(page_title="NeuroScan AI", page_icon="🧠",
+                   layout="wide", initial_sidebar_state="collapsed")
+
+MEDSAM_CKPT = "medsam_vit_b.pth"
+MEDSAM_URL = ("https://zenodo.org/records/10689643/files/"
+              "medsam_vit_b.pth?download=1")
 
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=DM+Sans:ital,wght@0,300;0,400;0,500;1,400&family=DM+Serif+Display&family=Space+Mono:wght@400;700&display=swap');
 
 html, body, [class*="css"] {
-    font-family: 'DM Sans', sans-serif;
-    background-color: #0c0f1a !important;
-    color: #c9cdd9;
+    font-family:'DM Sans',sans-serif; background-color:#0c0f1a !important; color:#c9cdd9;
 }
-.stApp, [data-testid="stAppViewContainer"],
-[data-testid="stHeader"], [data-testid="stToolbar"],
-[data-testid="stMain"] {
-    background-color: #0c0f1a !important;
-}
-#MainMenu, footer, header { visibility: hidden; }
-.block-container { padding: 0 4rem 6rem 4rem; max-width: 1200px; }
-
+.stApp,[data-testid="stAppViewContainer"],[data-testid="stHeader"],
+[data-testid="stToolbar"],[data-testid="stMain"] { background-color:#0c0f1a !important; }
+#MainMenu, footer, header { visibility:hidden; }
+.block-container { padding:0 4rem 6rem 4rem; max-width:1200px; }
 body {
     background-image:
-        radial-gradient(ellipse 60% 40% at 15% -5%, rgba(124,158,255,0.08), transparent 60%),
-        radial-gradient(ellipse 60% 40% at 100% 100%, rgba(155,107,255,0.06), transparent 70%);
-    background-attachment: fixed;
+        radial-gradient(ellipse 60% 40% at 15% -5%, rgba(124,158,255,.08), transparent 60%),
+        radial-gradient(ellipse 60% 40% at 100% 100%, rgba(155,107,255,.06), transparent 70%);
+    background-attachment:fixed;
 }
-
-/* Header */
-.ns-header {
-    display: flex; align-items: flex-start; justify-content: space-between;
-    padding: 2.8rem 0; border-bottom: 1px solid rgba(255,255,255,0.06);
-    margin-bottom: 3rem;
-}
-.ns-wordmark {
-    font-family: 'DM Serif Display', serif; font-size: 2.2rem;
-    color: #f0f2f8; letter-spacing: -0.01em; line-height: 1;
-}
-.ns-wordmark .scan { color: #7c9eff; }
-.ns-tagline {
-    font-family: 'Space Mono', monospace; font-size: 0.6rem; color: #3d4460;
-    letter-spacing: 0.14em; text-transform: uppercase; line-height: 1.8;
-    text-align: right; margin-top: 0.2rem;
-}
-
-/* Step headers */
-.ns-eyebrow {
-    font-family: 'Space Mono', monospace; font-size: 0.6rem;
-    letter-spacing: 0.18em; text-transform: uppercase;
-    color: #7c9eff; margin-bottom: 0.35rem;
-}
-.ns-title {
-    font-family: 'DM Serif Display', serif; font-size: 1.75rem;
-    color: #f0f2f8; letter-spacing: -0.015em; margin-bottom: 1.4rem; line-height: 1.1;
-}
-
-/* Upload */
-.ns-upload-hint {
-    font-family: 'Space Mono', monospace; font-size: 0.6rem; color: #3d4460;
-    letter-spacing: 0.1em; text-transform: uppercase; margin-top: 0.5rem;
-}
+.ns-header { display:flex; align-items:flex-start; justify-content:space-between;
+    padding:2.8rem 0; border-bottom:1px solid rgba(255,255,255,.06); margin-bottom:3rem; }
+.ns-wordmark { font-family:'DM Serif Display',serif; font-size:2.2rem; color:#f0f2f8;
+    letter-spacing:-.01em; line-height:1; }
+.ns-wordmark .scan { color:#7c9eff; }
+.ns-tagline { font-family:'Space Mono',monospace; font-size:.6rem; color:#3d4460;
+    letter-spacing:.14em; text-transform:uppercase; line-height:1.8; text-align:right; margin-top:.2rem; }
+.ns-eyebrow { font-family:'Space Mono',monospace; font-size:.6rem; letter-spacing:.18em;
+    text-transform:uppercase; color:#7c9eff; margin-bottom:.35rem; }
+.ns-title { font-family:'DM Serif Display',serif; font-size:1.75rem; color:#f0f2f8;
+    letter-spacing:-.015em; margin-bottom:1.4rem; line-height:1.1; }
+.ns-upload-hint { font-family:'Space Mono',monospace; font-size:.6rem; color:#3d4460;
+    letter-spacing:.1em; text-transform:uppercase; margin-top:.5rem; }
 [data-testid="stFileUploader"] section {
-    background: linear-gradient(160deg, #131829 0%, #0e1220 100%) !important;
-    border: 1px solid rgba(124,158,255,0.12) !important;
-    border-radius: 14px !important; padding: 1.5rem !important;
-}
-
-/* Info card */
-.ns-info-card {
-    background: linear-gradient(160deg, #131829 0%, #0e1220 100%);
-    border: 1px solid rgba(124,158,255,0.1);
-    border-radius: 14px; overflow: hidden;
-}
-.ns-info-row {
-    display: flex; justify-content: space-between; align-items: baseline;
-    padding: 0.85rem 1.4rem; border-bottom: 1px solid rgba(255,255,255,0.04);
-}
-.ns-info-row:last-child { border-bottom: none; }
-.ns-info-key {
-    font-family: 'Space Mono', monospace; font-size: 0.62rem; color: #3d4460;
-    text-transform: uppercase; letter-spacing: 0.12em;
-}
-.ns-info-val {
-    font-size: 0.82rem; color: #c9cdd9; text-align: right;
-    max-width: 58%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
-
-/* Image labels + wrap */
-.ns-img-label {
-    font-family: 'Space Mono', monospace; font-size: 0.58rem; color: #3d4460;
-    text-transform: uppercase; letter-spacing: 0.14em; margin-bottom: 0.5rem;
-}
-.ns-img-label-active {
-    font-family: 'Space Mono', monospace; font-size: 0.58rem; color: #7c9eff;
-    text-transform: uppercase; letter-spacing: 0.14em; margin-bottom: 0.5rem;
-}
-.ns-img-label-active::before { content: "● "; }
-.ns-img-wrap {
-    background: #090c14; border-radius: 10px; overflow: hidden;
-    border: 1px solid rgba(255,255,255,0.04);
-}
-
-/* Auto badge */
-.ns-auto-badge {
-    display: inline-flex; align-items: center; gap: 0.4rem;
-    background: rgba(124,158,255,0.07); border: 1px solid rgba(124,158,255,0.18);
-    border-radius: 20px; padding: 0.22rem 0.7rem;
-    font-family: 'Space Mono', monospace; font-size: 0.58rem; color: #7c9eff;
-    letter-spacing: 0.12em; text-transform: uppercase; margin-bottom: 0.5rem;
-}
-.ns-auto-badge::before { content: "●  "; }
-.ns-applied {
-    font-size: 0.78rem; color: #3d4460; font-style: italic; margin-bottom: 1.2rem;
-}
-.ns-applied b { color: #8b91a3; font-style: normal; font-weight: 400; }
-
-/* Manual card */
-.ns-manual-card {
-    background: linear-gradient(160deg, #131829 0%, #0e1220 100%);
-    border: 1px solid rgba(124,158,255,0.08);
-    border-radius: 12px; padding: 1.2rem 1.6rem; margin-bottom: 1.2rem;
-}
-.stCheckbox label {
-    color: #c9cdd9 !important; font-size: 0.88rem !important;
-    font-family: 'DM Sans', sans-serif !important;
-}
-
-/* Buttons */
-.stButton > button {
-    background: linear-gradient(135deg, #7c9eff 0%, #9b6bff 100%) !important;
-    color: #0c0f1a !important; font-family: 'DM Sans', sans-serif !important;
-    font-weight: 500 !important; border: none !important; border-radius: 8px !important;
-    padding: 0.6rem 1.6rem !important; font-size: 0.88rem !important;
-    letter-spacing: 0.02em !important;
-}
-.stButton > button:hover { opacity: 0.88 !important; }
-
-[data-testid="stDownloadButton"] button {
-    background: rgba(124,158,255,0.08) !important; color: #7c9eff !important;
-    border: 1px solid rgba(124,158,255,0.2) !important;
-    font-size: 0.84rem !important; border-radius: 8px !important;
-    padding: 0.5rem 1.2rem !important;
-}
-
-/* Result cards */
-.ns-result-tumor {
-    position: relative; overflow: hidden;
-    background: linear-gradient(160deg, #131829 0%, #160e28 100%);
-    border: 1px solid rgba(155,107,255,0.25); border-radius: 16px;
-    padding: 3rem 2rem; text-align: center; margin: 1.4rem 0;
-}
-.ns-result-tumor::before {
-    content: ''; position: absolute; top: -80px; right: -80px;
-    width: 280px; height: 280px;
-    background: radial-gradient(circle, rgba(155,107,255,0.12) 0%, transparent 65%);
-    pointer-events: none;
-}
-.ns-result-clear {
-    position: relative; overflow: hidden;
-    background: linear-gradient(160deg, #0d1a1a 0%, #0a1520 100%);
-    border: 1px solid rgba(100,220,180,0.2); border-radius: 16px;
-    padding: 3rem 2rem; text-align: center; margin: 1.4rem 0;
-}
-.ns-result-clear::before {
-    content: ''; position: absolute; top: -80px; right: -80px;
-    width: 280px; height: 280px;
-    background: radial-gradient(circle, rgba(100,220,180,0.08) 0%, transparent 65%);
-    pointer-events: none;
-}
-.ns-result-eyebrow {
-    font-family: 'Space Mono', monospace; font-size: 0.6rem;
-    letter-spacing: 0.16em; text-transform: uppercase; margin-bottom: 0.8rem;
-}
-.ns-eb-tumor { color: #9b6bff; }
-.ns-eb-clear { color: #64dcb4; }
-.ns-result-name-tumor {
-    font-family: 'DM Serif Display', serif; font-size: 3rem; color: #f0f2f8;
-    line-height: 1; margin-bottom: 0.6rem; letter-spacing: -0.02em;
-}
-.ns-result-name-clear {
-    font-family: 'DM Serif Display', serif; font-size: 3rem; color: #64dcb4;
-    line-height: 1; margin-bottom: 0.6rem; letter-spacing: -0.02em;
-}
-.ns-conf-tumor {
-    font-family: 'Space Mono', monospace; font-size: 0.82rem;
-    color: #9b6bff; letter-spacing: 0.06em;
-}
-.ns-conf-clear {
-    font-family: 'Space Mono', monospace; font-size: 0.82rem;
-    color: #64dcb4; letter-spacing: 0.06em;
-}
-.ns-rdiv { width: 200px; height: 1px; background: rgba(155,107,255,0.2); margin: 1.2rem auto; }
-.ns-rdiv-clear { width: 200px; height: 1px; background: rgba(100,220,180,0.15); margin: 1.2rem auto; }
-
-/* Metric tiles */
-.ns-metrics { display: flex; gap: 0.8rem; margin-top: 1.2rem; }
-.ns-metric {
-    flex: 1;
-    background: linear-gradient(160deg, #131829 0%, #0e1220 100%);
-    border: 1px solid rgba(124,158,255,0.1);
-    border-radius: 12px; padding: 1.1rem 0.8rem; text-align: center;
-}
-.ns-metric-key {
-    font-family: 'Space Mono', monospace; font-size: 0.55rem; color: #3d4460;
-    text-transform: uppercase; letter-spacing: 0.14em; margin-bottom: 0.4rem;
-}
-.ns-metric-val {
-    font-family: 'DM Serif Display', serif; font-size: 1.5rem; color: #f0f2f8;
-    line-height: 1;
-}
-.ns-metric-unit {
-    font-family: 'Space Mono', monospace; font-size: 0.6rem; color: #7c9eff;
-    margin-left: 0.15rem;
-}
-
-.ns-gradcam-note {
-    font-size: 0.8rem; color: #3d4460; font-style: italic; margin-bottom: 1.2rem;
-}
-.ns-cam-label {
-    font-family: 'Space Mono', monospace; font-size: 0.56rem; color: #3d4460;
-    text-transform: uppercase; letter-spacing: 0.14em; text-align: center;
-    margin-top: 0.5rem;
-}
-.ns-hr { border: none; border-top: 1px solid rgba(255,255,255,0.06); margin: 3rem 0; }
-
-.ns-empty { text-align: center; padding: 6rem 0 4rem 0; }
-.ns-empty-icon { font-size: 3.5rem; opacity: 0.08; margin-bottom: 1.2rem; }
-.ns-empty-text {
-    font-family: 'DM Serif Display', serif; font-size: 1rem; color: #1e2542;
-}
-
-.stSlider label {
-    color: #3d4460 !important; font-size: 0.78rem !important;
-    font-family: 'Space Mono', monospace !important;
-}
-
-/* Radio → toggle pill */
-div[data-testid="stRadio"] { margin-bottom: 1.2rem; }
-div[data-testid="stRadio"] > label { display: none; }
-div[data-testid="stRadio"] > div {
-    display: flex !important; gap: 0.3rem !important;
-    background: rgba(255,255,255,0.03) !important;
-    border: 1px solid rgba(255,255,255,0.06) !important;
-    border-radius: 10px !important; padding: 0.25rem !important;
-    width: fit-content !important;
-}
-div[data-testid="stRadio"] > div > label {
-    display: block !important; font-family: 'DM Sans', sans-serif !important;
-    font-size: 0.84rem !important; color: #8b91a3 !important;
-    padding: 0.45rem 1.1rem !important; border-radius: 7px !important;
-    cursor: pointer !important; margin: 0 !important;
-}
+    background:linear-gradient(160deg,#131829,#0e1220) !important;
+    border:1px solid rgba(124,158,255,.12) !important; border-radius:14px !important;
+    padding:1.5rem !important; }
+.ns-info-card { background:linear-gradient(160deg,#131829,#0e1220);
+    border:1px solid rgba(124,158,255,.1); border-radius:14px; overflow:hidden; }
+.ns-info-row { display:flex; justify-content:space-between; align-items:baseline;
+    padding:.85rem 1.4rem; border-bottom:1px solid rgba(255,255,255,.04); }
+.ns-info-row:last-child { border-bottom:none; }
+.ns-info-key { font-family:'Space Mono',monospace; font-size:.62rem; color:#3d4460;
+    text-transform:uppercase; letter-spacing:.12em; }
+.ns-info-val { font-size:.82rem; color:#c9cdd9; text-align:right; max-width:58%;
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.ns-img-label { font-family:'Space Mono',monospace; font-size:.58rem; color:#3d4460;
+    text-transform:uppercase; letter-spacing:.14em; margin-bottom:.5rem; }
+.ns-img-label-active { font-family:'Space Mono',monospace; font-size:.58rem; color:#7c9eff;
+    text-transform:uppercase; letter-spacing:.14em; margin-bottom:.5rem; }
+.ns-img-label-active::before { content:"● "; }
+.ns-img-wrap { background:#090c14; border-radius:10px; overflow:hidden;
+    border:1px solid rgba(255,255,255,.04); }
+.ns-auto-badge { display:inline-flex; align-items:center; gap:.4rem;
+    background:rgba(124,158,255,.07); border:1px solid rgba(124,158,255,.18);
+    border-radius:20px; padding:.22rem .7rem; font-family:'Space Mono',monospace;
+    font-size:.58rem; color:#7c9eff; letter-spacing:.12em; text-transform:uppercase;
+    margin-bottom:.5rem; }
+.ns-auto-badge::before { content:"●  "; }
+.ns-applied { font-size:.78rem; color:#3d4460; font-style:italic; margin-bottom:1.2rem; }
+.ns-applied b { color:#8b91a3; font-style:normal; font-weight:400; }
+.ns-manual-card { background:linear-gradient(160deg,#131829,#0e1220);
+    border:1px solid rgba(124,158,255,.08); border-radius:12px;
+    padding:1.2rem 1.6rem; margin-bottom:1.2rem; }
+.stCheckbox label { color:#c9cdd9 !important; font-size:.88rem !important;
+    font-family:'DM Sans',sans-serif !important; }
+.stButton > button { background:linear-gradient(135deg,#7c9eff,#9b6bff) !important;
+    color:#0c0f1a !important; font-family:'DM Sans',sans-serif !important;
+    font-weight:500 !important; border:none !important; border-radius:8px !important;
+    padding:.6rem 1.6rem !important; font-size:.88rem !important; letter-spacing:.02em !important; }
+.stButton > button:hover { opacity:.88 !important; }
+[data-testid="stDownloadButton"] button { background:rgba(124,158,255,.08) !important;
+    color:#7c9eff !important; border:1px solid rgba(124,158,255,.2) !important;
+    font-size:.84rem !important; border-radius:8px !important; padding:.5rem 1.2rem !important; }
+.ns-result-tumor, .ns-result-clear { position:relative; overflow:hidden;
+    border-radius:16px; padding:3rem 2rem; text-align:center; margin:1.4rem 0; }
+.ns-result-tumor { background:linear-gradient(160deg,#131829,#160e28);
+    border:1px solid rgba(155,107,255,.25); }
+.ns-result-clear { background:linear-gradient(160deg,#0d1a1a,#0a1520);
+    border:1px solid rgba(100,220,180,.2); }
+.ns-result-tumor::before, .ns-result-clear::before { content:''; position:absolute;
+    top:-80px; right:-80px; width:280px; height:280px; pointer-events:none; }
+.ns-result-tumor::before { background:radial-gradient(circle,rgba(155,107,255,.12),transparent 65%); }
+.ns-result-clear::before { background:radial-gradient(circle,rgba(100,220,180,.08),transparent 65%); }
+.ns-result-eyebrow { font-family:'Space Mono',monospace; font-size:.6rem;
+    letter-spacing:.16em; text-transform:uppercase; margin-bottom:.8rem; }
+.ns-eb-tumor { color:#9b6bff; } .ns-eb-clear { color:#64dcb4; }
+.ns-result-name-tumor, .ns-result-name-clear { font-family:'DM Serif Display',serif;
+    font-size:3rem; line-height:1; margin-bottom:.6rem; letter-spacing:-.02em; }
+.ns-result-name-tumor { color:#f0f2f8; } .ns-result-name-clear { color:#64dcb4; }
+.ns-conf-tumor, .ns-conf-clear { font-family:'Space Mono',monospace; font-size:.82rem;
+    letter-spacing:.06em; }
+.ns-conf-tumor { color:#9b6bff; } .ns-conf-clear { color:#64dcb4; }
+.ns-rdiv { width:200px; height:1px; background:rgba(155,107,255,.2); margin:1.2rem auto; }
+.ns-rdiv-clear { width:200px; height:1px; background:rgba(100,220,180,.15); margin:1.2rem auto; }
+.ns-metrics { display:flex; gap:.8rem; margin-top:1.2rem; }
+.ns-metric { flex:1; background:linear-gradient(160deg,#131829,#0e1220);
+    border:1px solid rgba(124,158,255,.1); border-radius:12px;
+    padding:1.1rem .8rem; text-align:center; }
+.ns-metric-key { font-family:'Space Mono',monospace; font-size:.55rem; color:#3d4460;
+    text-transform:uppercase; letter-spacing:.14em; margin-bottom:.4rem; }
+.ns-metric-val { font-family:'DM Serif Display',serif; font-size:1.5rem; color:#f0f2f8; line-height:1; }
+.ns-metric-unit { font-family:'Space Mono',monospace; font-size:.6rem; color:#7c9eff; margin-left:.15rem; }
+.ns-gradcam-note { font-size:.8rem; color:#3d4460; font-style:italic; margin-bottom:1.2rem; }
+.ns-cam-label { font-family:'Space Mono',monospace; font-size:.56rem; color:#3d4460;
+    text-transform:uppercase; letter-spacing:.14em; text-align:center; margin-top:.5rem; }
+.ns-hr { border:none; border-top:1px solid rgba(255,255,255,.06); margin:3rem 0; }
+.ns-empty { text-align:center; padding:6rem 0 4rem 0; }
+.ns-empty-icon { font-size:3.5rem; opacity:.08; margin-bottom:1.2rem; }
+.ns-empty-text { font-family:'DM Serif Display',serif; font-size:1rem; color:#1e2542; }
+.stSlider label { color:#3d4460 !important; font-size:.78rem !important;
+    font-family:'Space Mono',monospace !important; }
+div[data-testid="stRadio"] { margin-bottom:1.2rem; }
+div[data-testid="stRadio"] > label { display:none; }
+div[data-testid="stRadio"] > div { display:flex !important; gap:.3rem !important;
+    background:rgba(255,255,255,.03) !important; border:1px solid rgba(255,255,255,.06) !important;
+    border-radius:10px !important; padding:.25rem !important; width:fit-content !important; }
+div[data-testid="stRadio"] > div > label { display:block !important;
+    font-family:'DM Sans',sans-serif !important; font-size:.84rem !important;
+    color:#8b91a3 !important; padding:.45rem 1.1rem !important; border-radius:7px !important;
+    cursor:pointer !important; margin:0 !important; }
 div[data-testid="stRadio"] > div > label:has(input:checked) {
-    background: #1e2542 !important; color: #f0f2f8 !important;
-}
-div[data-testid="stRadio"] > div > label > div:first-child { display: none !important; }
+    background:#1e2542 !important; color:#f0f2f8 !important; }
+div[data-testid="stRadio"] > div > label > div:first-child { display:none !important; }
+div[data-testid="stTextInput"]:has(input[placeholder="__bbox__"]) {
+    position:absolute !important; opacity:0 !important; height:0 !important;
+    pointer-events:none !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -278,118 +153,209 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+# Helpers
+# ═════════════════════════════════════════════════════════════════════════════
 def load_nifti(uploaded):
-    import nibabel as nib
-    import tempfile
+    import nibabel as nib, tempfile
     suffix = ".nii.gz" if uploaded.name.endswith(".gz") else ".nii"
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
         tmp.write(uploaded.read())
-        tmp_path = tmp.name
+        path = tmp.name
     try:
-        img = nib.load(tmp_path)
-        data = img.get_fdata(dtype=np.float32)
+        data = nib.load(path).get_fdata(dtype=np.float32)
     finally:
-        os.unlink(tmp_path)
+        os.unlink(path)
     if data.ndim == 4:
         data = data[:, :, :, 0]
     return np.rot90(data, k=1, axes=(0, 1))
 
 
-def adaptive_preprocess(img: np.ndarray):
+def adaptive_preprocess(img):
     steps = []
     out = cv2.normalize(img.copy(), None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
     steps.append("normalisation")
-
     if out.mean() < 80:
         out = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(out)
         steps.append("CLAHE (dark scan)")
     else:
-        mask = out > 15
-        if mask.any():
-            out[mask] = cv2.equalizeHist(out[mask].reshape(-1, 1)).ravel()
+        m = out > 15
+        if m.any():
+            out[m] = cv2.equalizeHist(out[m].reshape(-1, 1)).ravel()
         steps.append("histogram eq.")
-
-    lap_var = cv2.Laplacian(out, cv2.CV_64F).var()
-    if lap_var > 500:
+    lap = cv2.Laplacian(out, cv2.CV_64F).var()
+    if lap > 500:
         out = cv2.fastNlMeansDenoising(out, h=15, templateWindowSize=7, searchWindowSize=21)
         steps.append("NLM denoising (noisy)")
-    elif lap_var > 150:
+    elif lap > 150:
         out = cv2.GaussianBlur(out, (3, 3), 0)
         steps.append("Gaussian 3×3")
     else:
         steps.append("no denoising")
-
     return out, " · ".join(steps)
 
 
-# ── Step 01: Upload ───────────────────────────────────────────────────────────
-st.markdown('<p class="ns-eyebrow">// 01</p><p class="ns-title">Upload MRI Scan</p>', unsafe_allow_html=True)
+def download_medsam():
+    """Stream the checkpoint to disk. urllib = stdlib, no wget/curl needed."""
+    if os.path.exists(MEDSAM_CKPT):
+        return True
+    bar = st.progress(0.0, text="Downloading MedSAM checkpoint (375 MB, one-time)…")
+    try:
+        with urllib.request.urlopen(MEDSAM_URL) as r, open(MEDSAM_CKPT, "wb") as f:
+            total = int(r.headers.get("Content-Length", 0)) or 375_000_000
+            done = 0
+            while True:
+                chunk = r.read(1 << 20)
+                if not chunk:
+                    break
+                f.write(chunk)
+                done += len(chunk)
+                bar.progress(min(done / total, 1.0),
+                             text=f"Downloading MedSAM… {done/1e6:.0f} / {total/1e6:.0f} MB")
+        bar.empty()
+        return True
+    except Exception as e:
+        bar.empty()
+        if os.path.exists(MEDSAM_CKPT):
+            os.remove(MEDSAM_CKPT)
+        st.error(f"Checkpoint download failed: {e}")
+        return False
+
+
+@st.cache_resource(show_spinner=False)
+def load_medsam():
+    """
+    Loaded once, cached across reruns. Only ever called from the
+    Run Segmentation button — never at import time.
+    """
+    import torch
+    from segment_anything import sam_model_registry
+    torch.set_num_threads(1)
+    sam = sam_model_registry["vit_b"](checkpoint=MEDSAM_CKPT)
+    sam.to("cpu").eval()
+    return sam
+
+
+def run_medsam(img_rgb, bbox):
+    """
+    MedSAM box-prompted segmentation, CPU, memory-disciplined.
+    Same maths as the Colab version. Returns a full-size uint8 mask.
+    """
+    import torch
+    gc.collect()
+
+    sam = load_medsam()
+    h, w = img_rgb.shape[:2]
+
+    img_1024 = cv2.resize(img_rgb, (1024, 1024))
+    img_1024 = (img_1024 - img_1024.min()) / (img_1024.max() - img_1024.min() + 1e-10)
+    tensor = torch.tensor(img_1024, dtype=torch.float32).permute(2, 0, 1)[None]
+
+    box = np.array(bbox, dtype=np.float32) * np.array(
+        [1024 / w, 1024 / h, 1024 / w, 1024 / h], dtype=np.float32)
+    box_t = torch.tensor(box, dtype=torch.float32)[None]
+
+    with torch.inference_mode():
+        emb = sam.image_encoder(tensor)
+        sparse, dense = sam.prompt_encoder(points=None, boxes=box_t, masks=None)
+        low_res, _ = sam.mask_decoder(
+            image_embeddings=emb,
+            image_pe=sam.prompt_encoder.get_dense_pe(),
+            sparse_prompt_embeddings=sparse,
+            dense_prompt_embeddings=dense,
+            multimask_output=False,
+        )
+        low_np = low_res.squeeze().cpu().numpy()
+
+    mask = cv2.resize((low_np > 0.0).astype(np.uint8), (w, h),
+                      interpolation=cv2.INTER_NEAREST)
+
+    del tensor, box_t, emb, sparse, dense, low_res
+    gc.collect()
+    return mask
+
+
+def trace_otsu(gray, bbox):
+    """Fallback if MedSAM can't run: Otsu inside the box."""
+    x1, y1, x2, y2 = bbox
+    h, w = gray.shape[:2]
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(w, x2), min(h, y2)
+    roi = gray[y1:y2, x1:x2]
+    if roi.size == 0:
+        return np.zeros((h, w), np.uint8)
+    _, m = cv2.threshold(cv2.GaussianBlur(roi, (5, 5), 0), 0, 255,
+                         cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, k, 2)
+    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, k, 1)
+    cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return np.zeros((h, w), np.uint8)
+    clean = np.zeros_like(m)
+    cv2.drawContours(clean, [max(cnts, key=cv2.contourArea)], -1, 255, cv2.FILLED)
+    full = np.zeros((h, w), np.uint8)
+    full[y1:y2, x1:x2] = clean
+    return full
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 01 · Upload
+# ═════════════════════════════════════════════════════════════════════════════
+st.markdown('<p class="ns-eyebrow">// 01</p><p class="ns-title">Upload MRI Scan</p>',
+            unsafe_allow_html=True)
 
 uploaded_file = st.file_uploader(
-    "upload",
-    type=["jpg", "jpeg", "png", "webp", "dcm", "nii", "gz"],
-    label_visibility="collapsed"
-)
+    "upload", type=["jpg", "jpeg", "png", "webp", "dcm", "nii", "gz"],
+    label_visibility="collapsed")
 st.markdown('<p class="ns-upload-hint">JPG · PNG · WebP · DICOM (.dcm) · NIfTI (.nii .nii.gz)</p>',
             unsafe_allow_html=True)
 
 if uploaded_file is None:
-    st.markdown("""
-    <div class="ns-empty">
-        <div class="ns-empty-icon">⬡</div>
-        <p class="ns-empty-text">Upload a scan above to begin</p>
-    </div>
-    """, unsafe_allow_html=True)
+    st.markdown('<div class="ns-empty"><div class="ns-empty-icon">⬡</div>'
+                '<p class="ns-empty-text">Upload a scan above to begin</p></div>',
+                unsafe_allow_html=True)
     st.stop()
 
 fname = uploaded_file.name.lower()
 is_dicom = fname.endswith(".dcm")
 is_nifti = fname.endswith(".nii") or fname.endswith(".nii.gz")
 pixel_spacing_mm = 1.0
-pixel_array = None
-img_array = None
+pixel_array = img_array = None
 
 if is_dicom:
-    dicom = pydicom.dcmread(uploaded_file)
-    pixel_array = dicom.pixel_array.squeeze()
+    dcm = pydicom.dcmread(uploaded_file)
+    pixel_array = dcm.pixel_array.squeeze()
     try:
-        pixel_spacing_mm = float(dicom.PixelSpacing[0])
+        pixel_spacing_mm = float(dcm.PixelSpacing[0])
     except Exception:
         pixel_spacing_mm = 1.0
 elif is_nifti:
     pixel_array = load_nifti(uploaded_file)
 else:
-    img = Image.open(uploaded_file)
-    img_array = np.array(img.convert("L")).squeeze()
+    img_array = np.array(Image.open(uploaded_file).convert("L")).squeeze()
 
-# ── Multi-slice scroller ──────────────────────────────────────────────────────
 if pixel_array is not None and pixel_array.ndim == 3:
-    n_slices = pixel_array.shape[2] if is_nifti else pixel_array.shape[0]
+    n = pixel_array.shape[2] if is_nifti else pixel_array.shape[0]
     st.markdown('<div class="ns-hr"></div>', unsafe_allow_html=True)
-    st.markdown(f'<p class="ns-eyebrow">Multi-Slice · {n_slices} slices detected</p>',
+    st.markdown(f'<p class="ns-eyebrow">Multi-Slice · {n} slices detected</p>',
                 unsafe_allow_html=True)
-
     if "slice_idx" not in st.session_state:
-        st.session_state.slice_idx = n_slices // 2
-
-    col_prev, col_slider, col_next = st.columns([1, 12, 1])
-    with col_prev:
+        st.session_state.slice_idx = n // 2
+    c1, c2, c3 = st.columns([1, 12, 1])
+    with c1:
         st.write("")
         if st.button("◀"):
             st.session_state.slice_idx = max(0, st.session_state.slice_idx - 1)
-    with col_slider:
+    with c2:
         st.session_state.slice_idx = st.slider(
-            "slice", 0, n_slices - 1,
-            min(st.session_state.slice_idx, n_slices - 1),
-            label_visibility="collapsed"
-        )
-    with col_next:
+            "slice", 0, n - 1, min(st.session_state.slice_idx, n - 1),
+            label_visibility="collapsed")
+    with c3:
         st.write("")
         if st.button("▶"):
-            st.session_state.slice_idx = min(n_slices - 1, st.session_state.slice_idx + 1)
-
-    st.caption(f"Slice {st.session_state.slice_idx + 1} / {n_slices}")
+            st.session_state.slice_idx = min(n - 1, st.session_state.slice_idx + 1)
+    st.caption(f"Slice {st.session_state.slice_idx + 1} / {n}")
     img_array = (pixel_array[:, :, st.session_state.slice_idx] if is_nifti
                  else pixel_array[st.session_state.slice_idx])
 elif pixel_array is not None:
@@ -397,44 +363,33 @@ elif pixel_array is not None:
 
 img_array = cv2.normalize(img_array, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
 
-# ── Scan preview + info ───────────────────────────────────────────────────────
 st.markdown('<div class="ns-hr"></div>', unsafe_allow_html=True)
-col_img, col_info = st.columns([3, 2])
-with col_img:
+ci, cf = st.columns([3, 2])
+with ci:
     st.markdown('<div class="ns-img-wrap">', unsafe_allow_html=True)
     st.image(img_array, use_container_width=True)
     st.markdown('</div>', unsafe_allow_html=True)
-with col_info:
+with cf:
     h_o, w_o = img_array.shape[:2]
     fmt = "DICOM" if is_dicom else "NIfTI" if is_nifti else "Image"
-    brightness = round(float(img_array.mean()), 1)
-    noise = round(float(cv2.Laplacian(img_array, cv2.CV_64F).var()), 1)
     st.markdown(f"""
     <div class="ns-info-card">
-        <div class="ns-info-row">
-            <span class="ns-info-key">File</span>
-            <span class="ns-info-val">{uploaded_file.name}</span>
-        </div>
-        <div class="ns-info-row">
-            <span class="ns-info-key">Format</span>
-            <span class="ns-info-val">{fmt}</span>
-        </div>
-        <div class="ns-info-row">
-            <span class="ns-info-key">Dimensions</span>
-            <span class="ns-info-val">{w_o} × {h_o} px</span>
-        </div>
-        <div class="ns-info-row">
-            <span class="ns-info-key">Mean Brightness</span>
-            <span class="ns-info-val">{brightness}</span>
-        </div>
-        <div class="ns-info-row">
-            <span class="ns-info-key">Noise (Laplacian)</span>
-            <span class="ns-info-val">{noise}</span>
-        </div>
+      <div class="ns-info-row"><span class="ns-info-key">File</span>
+        <span class="ns-info-val">{uploaded_file.name}</span></div>
+      <div class="ns-info-row"><span class="ns-info-key">Format</span>
+        <span class="ns-info-val">{fmt}</span></div>
+      <div class="ns-info-row"><span class="ns-info-key">Dimensions</span>
+        <span class="ns-info-val">{w_o} × {h_o} px</span></div>
+      <div class="ns-info-row"><span class="ns-info-key">Mean Brightness</span>
+        <span class="ns-info-val">{img_array.mean():.1f}</span></div>
+      <div class="ns-info-row"><span class="ns-info-key">Noise (Laplacian)</span>
+        <span class="ns-info-val">{cv2.Laplacian(img_array, cv2.CV_64F).var():.1f}</span></div>
     </div>
     """, unsafe_allow_html=True)
 
-# ── Step 02: Preprocessing ────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+# 02 · Preprocessing
+# ═════════════════════════════════════════════════════════════════════════════
 st.markdown('<div class="ns-hr"></div>', unsafe_allow_html=True)
 st.markdown('<p class="ns-eyebrow">// 02</p><p class="ns-title">Preprocessing</p>',
             unsafe_allow_html=True)
@@ -443,57 +398,54 @@ mode = st.radio("mode", ["Auto", "Manual"], horizontal=True,
                 label_visibility="collapsed", key="preprocess_radio")
 
 if mode == "Auto":
-    denoised, steps_applied = adaptive_preprocess(img_array)
+    denoised, applied = adaptive_preprocess(img_array)
     st.markdown('<span class="ns-auto-badge">AUTO</span>', unsafe_allow_html=True)
-    st.markdown(f'<p class="ns-applied"><b>Applied:</b> {steps_applied}</p>',
-                unsafe_allow_html=True)
+    st.markdown(f'<p class="ns-applied"><b>Applied:</b> {applied}</p>', unsafe_allow_html=True)
 else:
     st.markdown('<div class="ns-manual-card">', unsafe_allow_html=True)
-    col_a, col_b = st.columns(2)
-    with col_a:
+    ca, cb = st.columns(2)
+    with ca:
         do_norm = st.checkbox("Normalize", value=True)
         do_eq = st.checkbox("Histogram equalization")
         do_med = st.checkbox("Median filter")
-    with col_b:
+    with cb:
         do_clahe = st.checkbox("CLAHE contrast")
         do_gauss = st.checkbox("Gaussian blur")
         do_nlm = st.checkbox("Non-local means")
     st.markdown('</div>', unsafe_allow_html=True)
 
-    proc = img_array.copy()
+    p = img_array.copy()
     if do_norm:
-        proc = cv2.normalize(proc, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        p = cv2.normalize(p, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
     if do_clahe:
-        proc = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8)).apply(proc)
+        p = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8)).apply(p)
     if do_eq:
-        m = proc > 15
+        m = p > 15
         if m.any():
-            proc[m] = cv2.equalizeHist(proc[m].reshape(-1, 1)).ravel()
-
-    denoised = proc.copy()
+            p[m] = cv2.equalizeHist(p[m].reshape(-1, 1)).ravel()
+    denoised = p.copy()
     if do_gauss:
-        gk = st.slider("Gaussian kernel", 1, 15, 3, step=2)
-        denoised = cv2.GaussianBlur(denoised, (gk, gk), 0)
+        denoised = cv2.GaussianBlur(denoised, (st.slider("Gaussian kernel", 1, 15, 3, 2),) * 2, 0)
     if do_med:
-        mk = st.slider("Median kernel", 1, 15, 3, step=2)
-        denoised = cv2.medianBlur(denoised, mk)
+        denoised = cv2.medianBlur(denoised, st.slider("Median kernel", 1, 15, 3, 2))
     if do_nlm:
-        hs = st.slider("NLM strength", 1, 30, 10)
-        denoised = cv2.fastNlMeansDenoising(denoised, h=hs)
+        denoised = cv2.fastNlMeansDenoising(denoised, h=st.slider("NLM strength", 1, 30, 10))
 
-col1, col2 = st.columns(2)
-with col1:
+o1, o2 = st.columns(2)
+with o1:
     st.markdown('<p class="ns-img-label">ORIGINAL</p>', unsafe_allow_html=True)
     st.markdown('<div class="ns-img-wrap">', unsafe_allow_html=True)
     st.image(img_array, use_container_width=True)
     st.markdown('</div>', unsafe_allow_html=True)
-with col2:
+with o2:
     st.markdown('<p class="ns-img-label-active">PROCESSED</p>', unsafe_allow_html=True)
     st.markdown('<div class="ns-img-wrap">', unsafe_allow_html=True)
     st.image(denoised, use_container_width=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
-# ── Step 03: Diagnosis ────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+# 03 · Diagnosis
+# ═════════════════════════════════════════════════════════════════════════════
 st.markdown('<div class="ns-hr"></div>', unsafe_allow_html=True)
 st.markdown('<p class="ns-eyebrow">// 03</p><p class="ns-title">Diagnosis</p>',
             unsafe_allow_html=True)
@@ -501,242 +453,229 @@ st.markdown('<p class="ns-eyebrow">// 03</p><p class="ns-title">Diagnosis</p>',
 if st.button("Run Diagnosis ▶"):
     st.session_state.diagnosis_done = True
 
-if st.session_state.get("diagnosis_done"):
+if not st.session_state.get("diagnosis_done"):
+    st.stop()
+
+from predict import load_model, preprocess, predict, get_gradcam, overlay_gradcam
+
+model = load_model("brain_tumor_detector.pt")
+x = preprocess(denoised)
+gray128 = cv2.resize(denoised, (128, 128)).astype(np.float32) / 255.0
+
+with st.spinner("Analysing…"):
+    class_name, confidence, probs = predict(model, x)
+
+detected = class_name.lower().replace(" ", "")
+
+if detected == "notumor":
+    st.markdown(f"""
+    <div class="ns-result-clear">
+      <p class="ns-result-eyebrow ns-eb-clear">// Clear Scan</p>
+      <p class="ns-result-name-clear">No Tumor Detected</p>
+      <div class="ns-rdiv-clear"></div>
+      <p class="ns-conf-clear">{confidence*100:.1f}% confidence</p>
+    </div>""", unsafe_allow_html=True)
+else:
+    st.markdown(f"""
+    <div class="ns-result-tumor">
+      <p class="ns-result-eyebrow ns-eb-tumor">// Tumor Detected</p>
+      <p class="ns-result-name-tumor">{class_name}</p>
+      <div class="ns-rdiv"></div>
+      <p class="ns-conf-tumor">{confidence*100:.1f}% confidence</p>
+    </div>""", unsafe_allow_html=True)
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 04 · Grad-CAM
+# ═════════════════════════════════════════════════════════════════════════════
+st.markdown('<div class="ns-hr"></div>', unsafe_allow_html=True)
+st.markdown('<p class="ns-eyebrow">// 04</p><p class="ns-title">Grad-CAM Explanation</p>',
+            unsafe_allow_html=True)
+st.markdown("<p class='ns-gradcam-note'>Regions highlighted in red most influenced "
+            "the model's prediction.</p>", unsafe_allow_html=True)
+
+with st.spinner("Generating heatmap…"):
+    heat = get_gradcam(model, x, int(np.argmax(probs)))
+    overlaid = overlay_gradcam(gray128, heat)
+
+g1, g2, g3 = st.columns(3)
+for col, im, lbl in [(g1, gray128, "Original Scan"),
+                     (g2, heat, "Activation Heatmap"),
+                     (g3, overlaid, "Overlay")]:
+    with col:
+        st.markdown('<div class="ns-img-wrap">', unsafe_allow_html=True)
+        st.image(im, clamp=True, use_container_width=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+        st.markdown(f'<p class="ns-cam-label">{lbl}</p>', unsafe_allow_html=True)
+
+buf = io.BytesIO()
+Image.fromarray(overlaid).save(buf, format="PNG")
+st.download_button("⬇  Download Grad-CAM Report", buf.getvalue(),
+                   f"gradcam_{uploaded_file.name.rsplit('.', 1)[0]}.png", "image/png")
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 05 · MedSAM segmentation
+# ═════════════════════════════════════════════════════════════════════════════
+if detected == "notumor":
+    st.stop()
+
+st.markdown('<div class="ns-hr"></div>', unsafe_allow_html=True)
+st.markdown('<p class="ns-eyebrow">// 05</p><p class="ns-title">Tumor Segmentation</p>',
+            unsafe_allow_html=True)
+st.markdown("<p class='ns-gradcam-note'>Use the Grad-CAM heatmap as a guide. Draw a box "
+            "around the tumor — MedSAM traces the boundary inside it.</p>",
+            unsafe_allow_html=True)
+
+img_rgb = cv2.cvtColor(img_array, cv2.COLOR_GRAY2RGB)
+H, W = img_rgb.shape[:2]
+
+DW = 520
+DH = int(H * DW / W)
+_b = io.BytesIO()
+Image.fromarray(img_rgb).resize((DW, DH)).save(_b, format="PNG")
+b64 = base64.b64encode(_b.getvalue()).decode()
+sx, sy = round(W / DW, 6), round(H / DH, 6)
+
+components.html(f"""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500&family=Space+Mono&display=swap');
+#cv {{ border:1px solid rgba(124,158,255,.18); border-radius:10px;
+      cursor:crosshair; display:block; background:#090c14; }}
+#co {{ font-family:'Space Mono',monospace; font-size:11px; color:#3d4460;
+      margin-top:8px; min-height:16px; letter-spacing:.06em; }}
+#cb {{ margin-top:10px; padding:8px 20px; background:rgba(124,158,255,.08);
+      color:#7c9eff; border:1px solid rgba(124,158,255,.25); border-radius:8px;
+      cursor:pointer; font-family:'DM Sans',sans-serif; font-size:13px; font-weight:500; }}
+#cb:hover {{ background:rgba(124,158,255,.16); }}
+#dn {{ font-family:'Space Mono',monospace; font-size:11px; color:#64dcb4;
+      margin-left:12px; letter-spacing:.06em; }}
+</style>
+<canvas id="cv" width="{DW}" height="{DH}"></canvas>
+<div id="co"></div>
+<button id="cb" onclick="cf()">Confirm Box</button><span id="dn"></span>
+<script>
+(function() {{
+  const c=document.getElementById('cv'), x=c.getContext('2d'), im=new Image();
+  let ax,ay,dr=false,bx=null;
+  im.onload=()=>x.drawImage(im,0,0);
+  im.src='data:image/png;base64,{b64}';
+  c.addEventListener('mousedown',e=>{{const r=c.getBoundingClientRect();
+    ax=e.clientX-r.left; ay=e.clientY-r.top; dr=true;}});
+  c.addEventListener('mousemove',e=>{{ if(!dr) return;
+    const r=c.getBoundingClientRect(), px=e.clientX-r.left, py=e.clientY-r.top;
+    x.clearRect(0,0,c.width,c.height); x.drawImage(im,0,0);
+    x.strokeStyle='#7c9eff'; x.lineWidth=2; x.setLineDash([5,3]);
+    x.strokeRect(ax,ay,px-ax,py-ay);
+    bx={{x1:Math.round(Math.min(ax,px)),y1:Math.round(Math.min(ay,py)),
+         x2:Math.round(Math.max(ax,px)),y2:Math.round(Math.max(ay,py))}};
+    document.getElementById('co').innerText=
+      '('+bx.x1+', '+bx.y1+') → ('+bx.x2+', '+bx.y2+')';}});
+  c.addEventListener('mouseup',()=>{{dr=false;}});
+  window.cf=function() {{
+    if(!bx) {{ alert('Draw a box first.'); return; }}
+    const v=[Math.round(bx.x1*{sx}),Math.round(bx.y1*{sy}),
+             Math.round(bx.x2*{sx}),Math.round(bx.y2*{sy})].join(',');
+    for(const i of window.parent.document.querySelectorAll('input[type="text"]')) {{
+      if(i.placeholder==='__bbox__') {{
+        Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value')
+          .set.call(i,v);
+        i.dispatchEvent(new Event('input',{{bubbles:true}}));
+        document.getElementById('dn').innerText='✓ CONFIRMED';
+        return;
+      }}
+    }}
+    document.getElementById('dn').innerText=v;
+  }};
+}})();
+</script>
+""", height=DH + 110)
+
+raw = st.text_input("bbox", placeholder="__bbox__", key="bbox_receiver",
+                    label_visibility="collapsed")
+
+bbox = None
+if raw and raw != "__bbox__":
     try:
-        from predict import (load_model, preprocess, predict,
-                             get_gradcam, overlay_gradcam)
+        p = [int(v.strip()) for v in raw.split(",")]
+        if len(p) == 4 and p[0] < p[2] and p[1] < p[3]:
+            bbox = p
+    except Exception:
+        bbox = None
 
-        model = load_model("brain_tumor_detector.keras")
-        input_tensor = preprocess(denoised)
-        gray_128 = cv2.resize(denoised, (128, 128)).astype(np.float32) / 255.0
+if not bbox:
+    st.stop()
 
-        with st.spinner("Analysing..."):
-            class_name, confidence, all_probs = predict(model, input_tensor)
+if st.button("Run Segmentation ▶", key="run_seg"):
+    st.session_state.seg_done = True
 
-        detected = class_name.lower().replace(" ", "")
+if not st.session_state.get("seg_done"):
+    st.stop()
 
-        if detected == "notumor":
-            st.markdown(f"""
-            <div class="ns-result-clear">
-                <p class="ns-result-eyebrow ns-eb-clear">// Clear Scan</p>
-                <p class="ns-result-name-clear">No Tumor Detected</p>
-                <div class="ns-rdiv-clear"></div>
-                <p class="ns-conf-clear">{confidence*100:.1f}% confidence</p>
-            </div>
-            """, unsafe_allow_html=True)
-        else:
-            st.markdown(f"""
-            <div class="ns-result-tumor">
-                <p class="ns-result-eyebrow ns-eb-tumor">// Tumor Detected</p>
-                <p class="ns-result-name-tumor">{class_name}</p>
-                <div class="ns-rdiv"></div>
-                <p class="ns-conf-tumor">{confidence*100:.1f}% confidence</p>
-            </div>
-            """, unsafe_allow_html=True)
+if not download_medsam():
+    st.stop()
 
-        # ── Step 04: Grad-CAM ─────────────────────────────────────────────────
-        st.markdown('<div class="ns-hr"></div>', unsafe_allow_html=True)
-        st.markdown('<p class="ns-eyebrow">// 04</p><p class="ns-title">Grad-CAM Explanation</p>',
-                    unsafe_allow_html=True)
-        st.markdown('<p class="ns-gradcam-note">Regions highlighted in red most influenced '
-                    'the model\'s prediction.</p>', unsafe_allow_html=True)
+engine = "MedSAM"
+try:
+    with st.spinner("Running MedSAM… (first run loads the model, ~30s)"):
+        mask = run_medsam(img_rgb, bbox)
+except (MemoryError, RuntimeError) as e:
+    st.warning(f"MedSAM could not run in the available memory ({e}). "
+               "Falling back to Otsu thresholding.")
+    mask = trace_otsu(img_array, bbox)
+    engine = "Otsu fallback"
 
-        with st.spinner("Generating heatmap..."):
-            class_idx = int(np.argmax(all_probs))
-            heatmap = get_gradcam(model, input_tensor, class_idx)
-            overlaid = overlay_gradcam(gray_128, heatmap)
+cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        g1, g2, g3 = st.columns(3)
-        for col, im, label in [
-            (g1, gray_128, "Original Scan"),
-            (g2, heatmap, "Activation Heatmap"),
-            (g3, overlaid, "Overlay"),
-        ]:
-            with col:
-                st.markdown('<div class="ns-img-wrap">', unsafe_allow_html=True)
-                st.image(im, clamp=True, use_container_width=True)
-                st.markdown('</div>', unsafe_allow_html=True)
-                st.markdown(f'<p class="ns-cam-label">{label}</p>', unsafe_allow_html=True)
+box_img = img_rgb.copy()
+cv2.rectangle(box_img, (bbox[0], bbox[1]), (bbox[2], bbox[3]), (124, 158, 255), 2)
 
-        buf = io.BytesIO()
-        Image.fromarray(overlaid).save(buf, format="PNG")
-        st.download_button(
-            "⬇  Download Grad-CAM Report",
-            data=buf.getvalue(),
-            file_name=f"gradcam_{uploaded_file.name.rsplit('.', 1)[0]}.png",
-            mime="image/png"
-        )
+seg = img_rgb.copy()
+if cnts:
+    tint = np.zeros_like(seg)
+    tint[mask > 0] = [155, 107, 255]
+    seg = cv2.addWeighted(seg, 0.78, tint, 0.22, 0)
+    cv2.drawContours(seg, cnts, -1, (100, 220, 180), 2)
 
-        # ── Step 05: Region Annotation (canvas bbox, no segmentation) ─────────
-        if detected != "notumor":
-            st.markdown('<div class="ns-hr"></div>', unsafe_allow_html=True)
-            st.markdown('<p class="ns-eyebrow">// 05</p>'
-                        '<p class="ns-title">Region Annotation</p>',
-                        unsafe_allow_html=True)
-            st.markdown('<p class="ns-gradcam-note">Use the Grad-CAM heatmap above as a guide. '
-                        'Click and drag to draw a bounding box around the tumor region.</p>',
-                        unsafe_allow_html=True)
+s1, s2 = st.columns(2)
+with s1:
+    st.markdown('<p class="ns-img-label">BOX PROMPT</p>', unsafe_allow_html=True)
+    st.markdown('<div class="ns-img-wrap">', unsafe_allow_html=True)
+    st.image(box_img, use_container_width=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+with s2:
+    st.markdown(f'<p class="ns-img-label-active">{engine.upper()} SEGMENTATION</p>',
+                unsafe_allow_html=True)
+    st.markdown('<div class="ns-img-wrap">', unsafe_allow_html=True)
+    st.image(seg, use_container_width=True)
+    st.markdown('</div>', unsafe_allow_html=True)
 
-            img_rgb = cv2.cvtColor(img_array, cv2.COLOR_GRAY2RGB)
-            h_s, w_s = img_rgb.shape[:2]
+if not cnts:
+    st.warning("No region found inside the box. Try a tighter box around the tumor.")
+    st.stop()
 
-            DISPLAY_W = 520
-            display_h = int(h_s * DISPLAY_W / w_s)
-            disp = Image.fromarray(img_rgb).resize((DISPLAY_W, display_h))
-            _b = io.BytesIO()
-            disp.save(_b, format="PNG")
-            img_b64 = base64.b64encode(_b.getvalue()).decode()
+largest = max(cnts, key=cv2.contourArea)
+area = int(np.count_nonzero(mask)) * (pixel_spacing_mm ** 2)
+_, _, cw, ch = cv2.boundingRect(largest)
+(_, _), radius = cv2.minEnclosingCircle(largest)
+unit = "mm" if pixel_spacing_mm != 1.0 else "px"
 
-            sx = round(w_s / DISPLAY_W, 6)
-            sy = round(h_s / display_h, 6)
+st.markdown(f"""
+<div class="ns-metrics">
+  <div class="ns-metric"><p class="ns-metric-key">Tumor Area</p>
+    <p class="ns-metric-val">{area:,.0f}<span class="ns-metric-unit">{unit}²</span></p></div>
+  <div class="ns-metric"><p class="ns-metric-key">Width</p>
+    <p class="ns-metric-val">{cw*pixel_spacing_mm:.0f}<span class="ns-metric-unit">{unit}</span></p></div>
+  <div class="ns-metric"><p class="ns-metric-key">Height</p>
+    <p class="ns-metric-val">{ch*pixel_spacing_mm:.0f}<span class="ns-metric-unit">{unit}</span></p></div>
+  <div class="ns-metric"><p class="ns-metric-key">Max Diameter</p>
+    <p class="ns-metric-val">{radius*2*pixel_spacing_mm:.0f}<span class="ns-metric-unit">{unit}</span></p></div>
+</div>
+""", unsafe_allow_html=True)
 
-            canvas_html = f"""
-            <style>
-              @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500&family=Space+Mono&display=swap');
-              #cv {{
-                border: 1px solid rgba(124,158,255,0.18);
-                border-radius: 10px; cursor: crosshair; display: block;
-                background: #090c14;
-              }}
-              #coords {{
-                font-family: 'Space Mono', monospace; font-size: 11px;
-                color: #3d4460; margin-top: 8px; min-height: 16px;
-                letter-spacing: 0.06em;
-              }}
-              #confirm {{
-                margin-top: 10px; padding: 8px 20px;
-                background: rgba(124,158,255,0.08); color: #7c9eff;
-                border: 1px solid rgba(124,158,255,0.25);
-                border-radius: 8px; cursor: pointer;
-                font-family: 'DM Sans', sans-serif; font-size: 13px; font-weight: 500;
-              }}
-              #confirm:hover {{ background: rgba(124,158,255,0.16); }}
-              #done {{
-                font-family: 'Space Mono', monospace; font-size: 11px;
-                color: #64dcb4; margin-left: 12px; letter-spacing: 0.06em;
-              }}
-            </style>
-            <canvas id="cv" width="{DISPLAY_W}" height="{display_h}"></canvas>
-            <div id="coords"></div>
-            <button id="confirm" onclick="confirmBox()">Confirm Box</button>
-            <span id="done"></span>
-            <script>
-            (function() {{
-              const c = document.getElementById('cv');
-              const ctx = c.getContext('2d');
-              const im = new Image();
-              let sx0, sy0, drawing = false, box = null;
-              im.onload = () => ctx.drawImage(im, 0, 0);
-              im.src = 'data:image/png;base64,{img_b64}';
+buf2 = io.BytesIO()
+Image.fromarray(seg).save(buf2, format="PNG")
+st.markdown('<div style="margin-top:1.2rem;"></div>', unsafe_allow_html=True)
+st.download_button("⬇  Download Segmentation", buf2.getvalue(),
+                   f"segmentation_{uploaded_file.name.rsplit('.', 1)[0]}.png",
+                   "image/png", key="dl_seg")
 
-              c.addEventListener('mousedown', e => {{
-                const r = c.getBoundingClientRect();
-                sx0 = e.clientX - r.left; sy0 = e.clientY - r.top;
-                drawing = true;
-              }});
-              c.addEventListener('mousemove', e => {{
-                if (!drawing) return;
-                const r = c.getBoundingClientRect();
-                const cx = e.clientX - r.left, cy = e.clientY - r.top;
-                ctx.clearRect(0, 0, c.width, c.height);
-                ctx.drawImage(im, 0, 0);
-                ctx.strokeStyle = '#7c9eff';
-                ctx.lineWidth = 2;
-                ctx.setLineDash([5, 3]);
-                ctx.strokeRect(sx0, sy0, cx - sx0, cy - sy0);
-                box = {{
-                  x1: Math.round(Math.min(sx0, cx)), y1: Math.round(Math.min(sy0, cy)),
-                  x2: Math.round(Math.max(sx0, cx)), y2: Math.round(Math.max(sy0, cy))
-                }};
-                document.getElementById('coords').innerText =
-                  '(' + box.x1 + ', ' + box.y1 + ') → (' + box.x2 + ', ' + box.y2 + ')';
-              }});
-              c.addEventListener('mouseup', () => {{ drawing = false; }});
-
-              window.confirmBox = function() {{
-                if (!box) {{ alert('Draw a box first.'); return; }}
-                const x1 = Math.round(box.x1 * {sx}), y1 = Math.round(box.y1 * {sy});
-                const x2 = Math.round(box.x2 * {sx}), y2 = Math.round(box.y2 * {sy});
-                const val = x1 + ',' + y1 + ',' + x2 + ',' + y2;
-                const inputs = window.parent.document.querySelectorAll('input[type="text"]');
-                for (let inp of inputs) {{
-                  if (inp.placeholder === '__bbox__') {{
-                    const setter = Object.getOwnPropertyDescriptor(
-                      window.HTMLInputElement.prototype, 'value').set;
-                    setter.call(inp, val);
-                    inp.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                    document.getElementById('done').innerText = '✓ CONFIRMED';
-                    return;
-                  }}
-                }}
-                document.getElementById('done').innerText = val;
-              }};
-            }})();
-            </script>
-            """
-            components.html(canvas_html, height=display_h + 110)
-
-            bbox_raw = st.text_input("bbox", placeholder="__bbox__",
-                                     key="bbox_receiver", label_visibility="collapsed")
-
-            bbox = None
-            if bbox_raw and bbox_raw != "__bbox__":
-                try:
-                    parts = [int(p.strip()) for p in bbox_raw.split(",")]
-                    if len(parts) == 4 and parts[0] < parts[2] and parts[1] < parts[3]:
-                        bbox = parts
-                except Exception:
-                    bbox = None
-
-            if bbox:
-                x1, y1, x2, y2 = bbox
-                annotated = img_rgb.copy()
-                cv2.rectangle(annotated, (x1, y1), (x2, y2), (124, 158, 255), 2)
-
-                st.markdown('<p class="ns-img-label-active">ANNOTATED REGION</p>',
-                            unsafe_allow_html=True)
-                st.markdown('<div class="ns-img-wrap">', unsafe_allow_html=True)
-                st.image(annotated, use_container_width=True)
-                st.markdown('</div>', unsafe_allow_html=True)
-
-                bw = (x2 - x1) * pixel_spacing_mm
-                bh = (y2 - y1) * pixel_spacing_mm
-                area = bw * bh
-                diag = float(np.hypot(bw, bh))
-                unit = "mm" if pixel_spacing_mm != 1.0 else "px"
-
-                st.markdown(f"""
-                <div class="ns-metrics">
-                    <div class="ns-metric">
-                        <p class="ns-metric-key">Width</p>
-                        <p class="ns-metric-val">{bw:.0f}<span class="ns-metric-unit">{unit}</span></p>
-                    </div>
-                    <div class="ns-metric">
-                        <p class="ns-metric-key">Height</p>
-                        <p class="ns-metric-val">{bh:.0f}<span class="ns-metric-unit">{unit}</span></p>
-                    </div>
-                    <div class="ns-metric">
-                        <p class="ns-metric-key">Region Area</p>
-                        <p class="ns-metric-val">{area:,.0f}<span class="ns-metric-unit">{unit}²</span></p>
-                    </div>
-                    <div class="ns-metric">
-                        <p class="ns-metric-key">Diagonal</p>
-                        <p class="ns-metric-val">{diag:.0f}<span class="ns-metric-unit">{unit}</span></p>
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
-
-                buf_a = io.BytesIO()
-                Image.fromarray(annotated).save(buf_a, format="PNG")
-                st.markdown('<div style="margin-top:1.2rem;"></div>', unsafe_allow_html=True)
-                st.download_button(
-                    "⬇  Download Annotated Scan",
-                    data=buf_a.getvalue(),
-                    file_name=f"annotated_{uploaded_file.name.rsplit('.', 1)[0]}.png",
-                    mime="image/png",
-                    key="dl_annotated"
-                )
-
-    except Exception as e:
-        st.error(f"Diagnosis failed: {e}")
-        st.info("Make sure `brain_tumor_detector.keras` and `predict.py` are in the repo root.")
+gc.collect()
