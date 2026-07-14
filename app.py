@@ -14,13 +14,9 @@ import pydicom
 st.set_page_config(page_title="NeuroScan AI", page_icon="🧠",
                    layout="wide", initial_sidebar_state="collapsed")
 
-# The MedSAM model now runs on a separate backend service (not in this
-# Streamlit process), since loading it here was hitting Streamlit Cloud's
-# RAM ceiling. Set MEDSAM_BACKEND_URL in Streamlit Cloud's "Secrets" panel
-# (Settings -> Secrets) to your deployed backend's base URL, e.g.
-# https://neuroscan-medsam.onrender.com
-MEDSAM_BACKEND_URL = st.secrets.get("MEDSAM_BACKEND_URL", os.environ.get("MEDSAM_BACKEND_URL", ""))
-MEDSAM_TIMEOUT_S = 150  # Render free tier cold start (checkpoint download + model load) can exceed 45s
+# --- MedSAM backend config — commented out, not currently used (see section 05) ---
+# MEDSAM_BACKEND_URL = st.secrets.get("MEDSAM_BACKEND_URL", os.environ.get("MEDSAM_BACKEND_URL", ""))
+# MEDSAM_TIMEOUT_S = 150  # Render free tier cold start (checkpoint download + model load) can exceed 45s
 
 st.markdown("""
 <style>
@@ -199,39 +195,40 @@ def adaptive_preprocess(img):
     return out, " · ".join(steps)
 
 
-def call_medsam_backend(img_rgb, bbox):
-    """
-    Sends the image + box prompt to the separate MedSAM backend service and
-    returns a full-size uint8 mask (0/255). Replaces the old in-process
-    download_medsam()/load_medsam()/run_medsam() — MedSAM itself now runs on
-    its own service, not inside this Streamlit process.
-    """
-    if not MEDSAM_BACKEND_URL:
-        raise RuntimeError(
-            "MEDSAM_BACKEND_URL is not set. Add it in Streamlit Cloud's "
-            "Settings -> Secrets, e.g. MEDSAM_BACKEND_URL = \"https://your-service.onrender.com\""
-        )
-
-    ok, png_bytes = cv2.imencode(".png", cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR))
-    if not ok:
-        raise RuntimeError("failed to encode image for upload")
-
-    resp = requests.post(
-        f"{MEDSAM_BACKEND_URL.rstrip('/')}/segment",
-        files={"image": ("image.png", png_bytes.tobytes(), "image/png")},
-        data={"bbox": ",".join(str(int(v)) for v in bbox)},
-        timeout=MEDSAM_TIMEOUT_S,
-    )
-    resp.raise_for_status()
-    payload = resp.json()
-
-    mask_bytes = base64.b64decode(payload["mask_png_base64"])
-    mask_arr = cv2.imdecode(np.frombuffer(mask_bytes, np.uint8), cv2.IMREAD_GRAYSCALE)
-    return (mask_arr > 0).astype(np.uint8)
+# --- MedSAM backend call — commented out, not currently used (see section 05) ---
+# def call_medsam_backend(img_rgb, bbox):
+#     """
+#     Sends the image + box prompt to the separate MedSAM backend service and
+#     returns a full-size uint8 mask (0/255). Replaces the old in-process
+#     download_medsam()/load_medsam()/run_medsam() — MedSAM itself now runs on
+#     its own service, not inside this Streamlit process.
+#     """
+#     if not MEDSAM_BACKEND_URL:
+#         raise RuntimeError(
+#             "MEDSAM_BACKEND_URL is not set. Add it in Streamlit Cloud's "
+#             "Settings -> Secrets, e.g. MEDSAM_BACKEND_URL = \"https://your-service.onrender.com\""
+#         )
+#
+#     ok, png_bytes = cv2.imencode(".png", cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR))
+#     if not ok:
+#         raise RuntimeError("failed to encode image for upload")
+#
+#     resp = requests.post(
+#         f"{MEDSAM_BACKEND_URL.rstrip('/')}/segment",
+#         files={"image": ("image.png", png_bytes.tobytes(), "image/png")},
+#         data={"bbox": ",".join(str(int(v)) for v in bbox)},
+#         timeout=MEDSAM_TIMEOUT_S,
+#     )
+#     resp.raise_for_status()
+#     payload = resp.json()
+#
+#     mask_bytes = base64.b64decode(payload["mask_png_base64"])
+#     mask_arr = cv2.imdecode(np.frombuffer(mask_bytes, np.uint8), cv2.IMREAD_GRAYSCALE)
+#     return (mask_arr > 0).astype(np.uint8)
 
 
 def trace_otsu(gray, bbox):
-    """Fallback if MedSAM can't run: Otsu inside the box."""
+    """Otsu thresholding inside the box to trace the tumor boundary."""
     x1, y1, x2, y2 = bbox
     h, w = gray.shape[:2]
     x1, y1 = max(0, x1), max(0, y1)
@@ -474,7 +471,7 @@ st.download_button("⬇  Download Grad-CAM Report", buf.getvalue(),
                    f"gradcam_{uploaded_file.name.rsplit('.', 1)[0]}.png", "image/png")
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 05 · MedSAM segmentation
+# 05 · Segmentation (MedSAM backend temporarily disabled — see call_medsam_backend below)
 # ═════════════════════════════════════════════════════════════════════════════
 if detected == "notumor":
     st.stop()
@@ -483,7 +480,7 @@ st.markdown('<div class="ns-hr"></div>', unsafe_allow_html=True)
 st.markdown('<p class="ns-eyebrow">// 05</p><p class="ns-title">Tumor Segmentation</p>',
             unsafe_allow_html=True)
 st.markdown("<p class='ns-gradcam-note'>Use the Grad-CAM heatmap as a guide. Draw a box "
-            "around the tumor — MedSAM traces the boundary inside it.</p>",
+            "around the tumor to trace its boundary.</p>",
             unsafe_allow_html=True)
 
 img_rgb = cv2.cvtColor(img_array, cv2.COLOR_GRAY2RGB)
@@ -579,33 +576,38 @@ if st.button("Run Segmentation ▶", key="run_seg"):
 if not st.session_state.get("seg_done"):
     st.stop()
 
-engine = "MedSAM"
-try:
-    with st.spinner("Running MedSAM on the backend service…"):
-        mask = call_medsam_backend(img_rgb, bbox)
-except Exception as e:
-    import traceback
-    msg = str(e)
+engine = "Segmentation"
 
-    # Show the FULL traceback on screen — same reasoning as before: a
-    # one-line summary hides the actual cause. Screenshot this if it appears.
-    with st.expander("⚠  MedSAM backend error — expand and screenshot this", expanded=True):
-        st.caption(f"app.py build: backend-service-v1   |   {type(e).__name__}")
-        st.code("".join(traceback.format_exception(type(e), e, e.__traceback__)),
-                language="text")
+# --- MedSAM backend temporarily disabled — using Otsu directly for now ---
+# try:
+#     with st.spinner("Running MedSAM on the backend service…"):
+#         mask = call_medsam_backend(img_rgb, bbox)
+# except Exception as e:
+#     import traceback
+#     msg = str(e)
+#
+#     # Show the FULL traceback on screen — same reasoning as before: a
+#     # one-line summary hides the actual cause. Screenshot this if it appears.
+#     with st.expander("⚠  MedSAM backend error — expand and screenshot this", expanded=True):
+#         st.caption(f"app.py build: backend-service-v1   |   {type(e).__name__}")
+#         st.code("".join(traceback.format_exception(type(e), e, e.__traceback__)),
+#                 language="text")
+#
+#     if isinstance(e, requests.exceptions.Timeout):
+#         st.warning("MedSAM backend timed out (cold start or overload). "
+#                    "Falling back to Otsu thresholding.")
+#     elif isinstance(e, requests.exceptions.ConnectionError):
+#         st.warning("Couldn't reach the MedSAM backend service — check it's deployed "
+#                    "and MEDSAM_BACKEND_URL is set correctly. Falling back to Otsu thresholding.")
+#     else:
+#         st.warning(f"MedSAM backend call failed ({type(e).__name__}: {msg}). "
+#                    "Falling back to Otsu thresholding.")
+#     # Otsu benefits from the contrast enhancement, unlike the CNN.
+#     mask = trace_otsu(denoised, bbox)
+#     engine = "Otsu fallback"
 
-    if isinstance(e, requests.exceptions.Timeout):
-        st.warning("MedSAM backend timed out (cold start or overload). "
-                   "Falling back to Otsu thresholding.")
-    elif isinstance(e, requests.exceptions.ConnectionError):
-        st.warning("Couldn't reach the MedSAM backend service — check it's deployed "
-                   "and MEDSAM_BACKEND_URL is set correctly. Falling back to Otsu thresholding.")
-    else:
-        st.warning(f"MedSAM backend call failed ({type(e).__name__}: {msg}). "
-                   "Falling back to Otsu thresholding.")
-    # Otsu benefits from the contrast enhancement, unlike the CNN.
+with st.spinner("Running segmentation…"):
     mask = trace_otsu(denoised, bbox)
-    engine = "Otsu fallback"
 
 cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
