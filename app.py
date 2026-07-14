@@ -2,7 +2,7 @@ import os
 import io
 import gc
 import base64
-import urllib.request
+import requests
 
 import streamlit as st
 import streamlit.components.v1 as components
@@ -14,9 +14,13 @@ import pydicom
 st.set_page_config(page_title="NeuroScan AI", page_icon="🧠",
                    layout="wide", initial_sidebar_state="collapsed")
 
-MEDSAM_CKPT = "medsam_vit_b.pth"
-MEDSAM_URL = ("https://zenodo.org/records/10689643/files/"
-              "medsam_vit_b.pth?download=1")
+# The MedSAM model now runs on a separate backend service (not in this
+# Streamlit process), since loading it here was hitting Streamlit Cloud's
+# RAM ceiling. Set MEDSAM_BACKEND_URL in Streamlit Cloud's "Secrets" panel
+# (Settings -> Secrets) to your deployed backend's base URL, e.g.
+# https://neuroscan-medsam.onrender.com
+MEDSAM_BACKEND_URL = st.secrets.get("MEDSAM_BACKEND_URL", os.environ.get("MEDSAM_BACKEND_URL", ""))
+MEDSAM_TIMEOUT_S = 45
 
 st.markdown("""
 <style>
@@ -195,145 +199,35 @@ def adaptive_preprocess(img):
     return out, " · ".join(steps)
 
 
-MIN_CKPT_BYTES = 300_000_000        # real file is ~375 MB
-
-
-def _ckpt_is_valid(path):
+def call_medsam_backend(img_rgb, bbox):
     """
-    A .pth is a ZIP archive. A truncated download or an HTML error page saved
-    under the .pth name will pass os.path.exists() but blow up inside torch.load
-    with 'failed finding central directory'. Check size + ZIP magic bytes.
+    Sends the image + box prompt to the separate MedSAM backend service and
+    returns a full-size uint8 mask (0/255). Replaces the old in-process
+    download_medsam()/load_medsam()/run_medsam() — MedSAM itself now runs on
+    its own service, not inside this Streamlit process.
     """
-    if not os.path.exists(path):
-        return False
-    if os.path.getsize(path) < MIN_CKPT_BYTES:
-        return False
-    with open(path, "rb") as f:
-        return f.read(2) == b"PK"       # ZIP magic
-
-
-def download_medsam():
-    """Stream the checkpoint, validate it, and re-fetch if the cached one is bad."""
-    if _ckpt_is_valid(MEDSAM_CKPT):
-        return True
-
-    if os.path.exists(MEDSAM_CKPT):
-        st.info("Cached checkpoint was incomplete or corrupt — re-downloading.")
-        os.remove(MEDSAM_CKPT)
-
-    bar = st.progress(0.0, text="Downloading MedSAM checkpoint (375 MB, one-time)…")
-    try:
-        # Zenodo 403s the default urllib User-Agent and serves an HTML page
-        # instead of the file — which is exactly how you end up with a
-        # 'corrupt' .pth that is really just HTML.
-        req = urllib.request.Request(
-            MEDSAM_URL, headers={"User-Agent": "Mozilla/5.0 (NeuroScan)"})
-        with urllib.request.urlopen(req, timeout=60) as r, open(MEDSAM_CKPT, "wb") as f:
-            ctype = r.headers.get("Content-Type", "")
-            if "html" in ctype.lower():
-                raise RuntimeError(f"server returned a web page, not a file ({ctype})")
-
-            total = int(r.headers.get("Content-Length", 0)) or 375_000_000
-            done = 0
-            while True:
-                chunk = r.read(1 << 20)
-                if not chunk:
-                    break
-                f.write(chunk)
-                done += len(chunk)
-                bar.progress(min(done / total, 1.0),
-                             text=f"Downloading MedSAM… {done/1e6:.0f} / {total/1e6:.0f} MB")
-        bar.empty()
-
-        if not _ckpt_is_valid(MEDSAM_CKPT):
-            size = os.path.getsize(MEDSAM_CKPT) if os.path.exists(MEDSAM_CKPT) else 0
-            os.remove(MEDSAM_CKPT)
-            raise RuntimeError(
-                f"downloaded file failed validation ({size/1e6:.1f} MB, expected ~375 MB)")
-
-        return True
-
-    except Exception as e:
-        bar.empty()
-        if os.path.exists(MEDSAM_CKPT):
-            os.remove(MEDSAM_CKPT)
-        st.error(f"MedSAM checkpoint download failed: {e}")
-        return False
-
-
-@st.cache_resource(show_spinner=False)
-def load_medsam():
-    """
-    Loaded once, cached across reruns. Only ever called from the
-    Run Segmentation button — never at import time.
-
-    The MedSAM weights were saved on a GPU. segment_anything's
-    sam_model_registry calls torch.load() internally WITHOUT map_location, so
-    on a CPU-only box it raises:
-        "Attempting to deserialize object on a CUDA device"
-
-    Rather than depend on that library's internals, we temporarily force
-    map_location="cpu" onto torch.load for the duration of the call. This
-    works no matter how segment_anything chooses to load the file.
-    """
-    import torch
-    from segment_anything import sam_model_registry
-
-    torch.set_num_threads(1)
-
-    _orig_load = torch.load
-
-    def _cpu_load(*args, **kwargs):
-        kwargs["map_location"] = torch.device("cpu")
-        return _orig_load(*args, **kwargs)
-
-    torch.load = _cpu_load
-    try:
-        sam = sam_model_registry["vit_b"](checkpoint=MEDSAM_CKPT)
-    finally:
-        torch.load = _orig_load          # always restore, even on error
-
-    sam.to("cpu").eval()
-    return sam
-
-
-def run_medsam(img_rgb, bbox):
-    """
-    MedSAM box-prompted segmentation, CPU, memory-disciplined.
-    Same maths as the Colab version. Returns a full-size uint8 mask.
-    """
-    import torch
-    gc.collect()
-
-    sam = load_medsam()
-    h, w = img_rgb.shape[:2]
-
-    img_1024 = cv2.resize(img_rgb, (1024, 1024))
-    img_1024 = (img_1024 - img_1024.min()) / (img_1024.max() - img_1024.min() + 1e-10)
-    tensor = torch.tensor(img_1024, dtype=torch.float32).permute(2, 0, 1)[None]
-
-    box = np.array(bbox, dtype=np.float32) * np.array(
-        [1024 / w, 1024 / h, 1024 / w, 1024 / h], dtype=np.float32)
-    box_t = torch.tensor(box, dtype=torch.float32)[None]
-
-    with torch.inference_mode():
-        emb = sam.image_encoder(tensor)
-        sparse, dense = sam.prompt_encoder(points=None, boxes=box_t, masks=None)
-        low_res, _ = sam.mask_decoder(
-            image_embeddings=emb,
-            image_pe=sam.prompt_encoder.get_dense_pe(),
-            sparse_prompt_embeddings=sparse,
-            dense_prompt_embeddings=dense,
-            multimask_output=False,
+    if not MEDSAM_BACKEND_URL:
+        raise RuntimeError(
+            "MEDSAM_BACKEND_URL is not set. Add it in Streamlit Cloud's "
+            "Settings -> Secrets, e.g. MEDSAM_BACKEND_URL = \"https://your-service.onrender.com\""
         )
-        low_np = low_res.squeeze().cpu().numpy()
 
-    mask = cv2.resize((low_np > 0.0).astype(np.uint8), (w, h),
-                      interpolation=cv2.INTER_NEAREST)
+    ok, png_bytes = cv2.imencode(".png", cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR))
+    if not ok:
+        raise RuntimeError("failed to encode image for upload")
 
-    del tensor, box_t, emb, sparse, dense, low_res
-    gc.collect()
-    return mask
+    resp = requests.post(
+        f"{MEDSAM_BACKEND_URL.rstrip('/')}/segment",
+        files={"image": ("image.png", png_bytes.tobytes(), "image/png")},
+        data={"bbox": ",".join(str(int(v)) for v in bbox)},
+        timeout=MEDSAM_TIMEOUT_S,
+    )
+    resp.raise_for_status()
+    payload = resp.json()
+
+    mask_bytes = base64.b64decode(payload["mask_png_base64"])
+    mask_arr = cv2.imdecode(np.frombuffer(mask_bytes, np.uint8), cv2.IMREAD_GRAYSCALE)
+    return (mask_arr > 0).astype(np.uint8)
 
 
 def trace_otsu(gray, bbox):
@@ -685,38 +579,29 @@ if st.button("Run Segmentation ▶", key="run_seg"):
 if not st.session_state.get("seg_done"):
     st.stop()
 
-if not download_medsam():
-    st.stop()
-
 engine = "MedSAM"
 try:
-    with st.spinner("Running MedSAM… (first run loads the model, ~30s)"):
-        mask = run_medsam(img_rgb, bbox)
+    with st.spinner("Running MedSAM on the backend service…"):
+        mask = call_medsam_backend(img_rgb, bbox)
 except Exception as e:
     import traceback
     msg = str(e)
 
-    # Show the FULL traceback on screen. A one-line summary has repeatedly
-    # hidden the actual cause. Screenshot this panel if it appears.
-    with st.expander("⚠  MedSAM traceback — expand and screenshot this", expanded=True):
-        st.caption(f"app.py build: cpu-load-patch-v3   |   {type(e).__name__}")
+    # Show the FULL traceback on screen — same reasoning as before: a
+    # one-line summary hides the actual cause. Screenshot this if it appears.
+    with st.expander("⚠  MedSAM backend error — expand and screenshot this", expanded=True):
+        st.caption(f"app.py build: backend-service-v1   |   {type(e).__name__}")
         st.code("".join(traceback.format_exception(type(e), e, e.__traceback__)),
                 language="text")
 
-    if "central directory" in msg or "PytorchStreamReader" in msg:
-        # Corrupt checkpoint, NOT memory. Bust the cache so the next click
-        # re-downloads instead of failing on the same bad file forever.
-        load_medsam.clear()
-        if os.path.exists(MEDSAM_CKPT):
-            os.remove(MEDSAM_CKPT)
-        st.error("The MedSAM checkpoint on disk was corrupt. It has been deleted — "
-                 "click **Run Segmentation** again to re-download it.")
-        st.stop()
-    elif isinstance(e, MemoryError) or "out of memory" in msg.lower() or "alloc" in msg.lower():
-        st.warning("MedSAM ran out of memory on this instance. "
+    if isinstance(e, requests.exceptions.Timeout):
+        st.warning("MedSAM backend timed out (cold start or overload). "
                    "Falling back to Otsu thresholding.")
+    elif isinstance(e, requests.exceptions.ConnectionError):
+        st.warning("Couldn't reach the MedSAM backend service — check it's deployed "
+                   "and MEDSAM_BACKEND_URL is set correctly. Falling back to Otsu thresholding.")
     else:
-        st.warning(f"MedSAM failed ({type(e).__name__}: {msg}). "
+        st.warning(f"MedSAM backend call failed ({type(e).__name__}: {msg}). "
                    "Falling back to Otsu thresholding.")
     # Otsu benefits from the contrast enhancement, unlike the CNN.
     mask = trace_otsu(denoised, bbox)
